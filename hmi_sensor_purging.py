@@ -1,240 +1,382 @@
 import sys
 import time
+import os
 from datetime import datetime
-import RPi.GPIO as GPIO
 
+# --- IMPORT PYQT5 FOR HMI GUI ---
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QTextEdit, QProgressBar
+    QPushButton, QLabel, QFrame, QTextEdit, QProgressBar, QGridLayout
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt5.QtGui import QFont, QPixmap
 
-# --- KONFIGURASI PIN GPIO ---
-RELAY_WATER_PIN = 17  # GPIO 17 -> Valve Air
-RELAY_AIR_PIN = 27    # GPIO 27 -> Valve Udara Tekan
+# --- GPIO SETUP ---
+RELAY_P_WATER = 17  # GPIO 17 -> Solenoid Air (Partikuler)
+RELAY_P_AIR   = 27  # GPIO 27 -> Solenoid Udara (Partikuler)
+RELAY_A_WATER = 22  # GPIO 22 -> Solenoid Air (Amonia)
+RELAY_A_AIR   = 23  # GPIO 23 -> Solenoid Udara (Amonia)
 
-# Kebanyakan modul relay bersifat Active-LOW (LOW = Relay On/Klep Buka)
-RELAY_ON = GPIO.LOW
-RELAY_OFF = GPIO.HIGH
+RELAY_ON  = 0  # Active-LOW Relay
+RELAY_OFF = 1
 
-# Inisialisasi Setup GPIO Raspberry Pi
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-GPIO.setup(RELAY_WATER_PIN, GPIO.OUT, initial=RELAY_OFF)
-GPIO.setup(RELAY_AIR_PIN, GPIO.OUT, initial=RELAY_OFF)
+try:
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    for pin in [RELAY_P_WATER, RELAY_P_AIR, RELAY_A_WATER, RELAY_A_AIR]:
+        GPIO.setup(pin, GPIO.OUT, initial=RELAY_OFF)
+    IS_PI = True
+except (ImportError, RuntimeError):
+    IS_PI = False
+
+# --- ADC ADS1115 SETUP ---
+try:
+    import board
+    import busio
+    import adafruit_ads1x15.ads1115 as ADS
+    from adafruit_ads1x15.analog_in import AnalogIn
+    i2c = busio.I2C(board.SCL, board.SDA)
+    ads = ADS.ADS1115(i2c)
+    chan_p = AnalogIn(ads, ADS.P0)  # Channel A0: Partikuler
+    chan_a = AnalogIn(ads, ADS.P1)  # Channel A1: Amonia
+    HAS_ADC = True
+except Exception:
+    HAS_ADC = False
+
+# --- DURASI PURGING (15 Menit Water + 15 Menit Air) ---
+WATER_DURATION_SEC = 15 * 60  # 900 detik
+AIR_DURATION_SEC   = 15 * 60  # 900 detik
 
 
+# ==============================================================================
+# THREAD PURGING SEKUENSIAL (NON-BLOCKING HMI)
+# ==============================================================================
 class PurgingWorker(QThread):
-    status_signal = pyqtSignal(str)
-    log_signal = pyqtSignal(str)
-    water_status_signal = pyqtSignal(bool)
-    air_status_signal = pyqtSignal(bool)
-    progress_signal = pyqtSignal(int)
-    finished_signal = pyqtSignal()
+    status_signal = pyqtSignal(str, str)     # unit, status text
+    log_signal = pyqtSignal(str)              # log message
+    valve_signal = pyqtSignal(str, bool, bool) # unit, water_on, air_on
+    progress_signal = pyqtSignal(str, int)    # unit, progress %
+    finished_signal = pyqtSignal(str)         # unit
 
-    def __init__(self, water_time=5, air_time=10):
+    def __init__(self, unit_name, water_pin, air_pin):
         super().__init__()
-        self.water_time = water_time
-        self.air_time = air_time
+        self.unit_name = unit_name
+        self.water_pin = water_pin
+        self.air_pin = air_pin
         self._is_running = True
 
     def run(self):
-        total_time = self.water_time + self.air_time
-        current_progress = 0
+        total_time = WATER_DURATION_SEC + AIR_DURATION_SEC
+        elapsed = 0
 
-        # TAHAP 1: WATER FLUSHING
-        if not self._is_running:
-            return
-        self.log_signal.emit("START: Memulai Water Flushing (Melarutkan Kerak)...")
-        self.status_signal.emit("WATER FLUSHING (PEMBERSIHAN AIR)")
+        # TAHAP 1: WATER FLUSHING (15 MENIT)
+        if not self._is_running: return
+        self.log_signal.emit(f"[{self.unit_name}] TAHAP 1: Memulai Water Flushing (15 Menit)...")
+        self.status_signal.emit(self.unit_name, "WATER FLUSHING")
         self.set_valves(water_on=True, air_on=False)
 
-        for i in range(self.water_time):
-            if not self._is_running:
-                break
+        for _ in range(WATER_DURATION_SEC):
+            if not self._is_running: break
             time.sleep(1)
-            current_progress += (1 / total_time) * 100
-            self.progress_signal.emit(int(current_progress))
-            self.log_signal.emit(f"-> Menyemprot air... Sisa: {self.water_time - (i + 1)} detik")
+            elapsed += 1
+            self.progress_signal.emit(self.unit_name, int((elapsed / total_time) * 100))
 
-        # TAHAP 2: AIR PURGING & DRYING
+        # TAHAP 2: AIR PURGING (15 MENIT)
         if self._is_running:
-            self.log_signal.emit("START: Memulai Air Purging (Pengeringan Optik)...")
-            self.status_signal.emit("AIR PURGING (PENGERINGAN UDARA)")
+            self.log_signal.emit(f"[{self.unit_name}] TAHAP 2: Memulai Air Purging (15 Menit)...")
+            self.status_signal.emit(self.unit_name, "AIR PURGING")
             self.set_valves(water_on=False, air_on=True)
 
-            for i in range(self.air_time):
-                if not self._is_running:
-                    break
+            for _ in range(AIR_DURATION_SEC):
+                if not self._is_running: break
                 time.sleep(1)
-                current_progress += (1 / total_time) * 100
-                self.progress_signal.emit(int(current_progress))
-                self.log_signal.emit(f"-> Menyemprot udara... Sisa: {self.air_time - (i + 1)} detik")
+                elapsed += 1
+                self.progress_signal.emit(self.unit_name, int((elapsed / total_time) * 100))
 
-        # STANDBY
+        # SELESAI / STANDBY
         self.set_valves(water_on=False, air_on=False)
         if self._is_running:
-            self.log_signal.emit("Siklus Pembersihan Selesai. Sensor Siap Digunakan.")
-            self.status_signal.emit("STANDBY / MONITORING")
-            self.progress_signal.emit(100)
+            self.log_signal.emit(f"[{self.unit_name}] Pembersihan Sekuensial Selesai. System Standby.")
+            self.status_signal.emit(self.unit_name, "STANDBY")
+            self.progress_signal.emit(self.unit_name, 100)
         else:
-            self.log_signal.emit("Pembersihan Dihentikan Paksa (Emergency Stop).")
-            self.status_signal.emit("EMERGENCY STOPPED")
+            self.log_signal.emit(f"[{self.unit_name}] Pembersihan Dihentikan (Emergency Stop).")
+            self.status_signal.emit(self.unit_name, "STOPPED")
 
-        self.finished_signal.emit()
+        self.finished_signal.emit(self.unit_name)
 
     def set_valves(self, water_on: bool, air_on: bool):
-        self.water_status_signal.emit(water_on)
-        self.air_status_signal.emit(air_on)
-        GPIO.output(RELAY_WATER_PIN, RELAY_ON if water_on else RELAY_OFF)
-        GPIO.output(RELAY_AIR_PIN, RELAY_ON if air_on else RELAY_OFF)
+        self.valve_signal.emit(self.unit_name, water_on, air_on)
+        if IS_PI:
+            GPIO.output(self.water_pin, RELAY_ON if water_on else RELAY_OFF)
+            GPIO.output(self.air_pin, RELAY_ON if air_on else RELAY_OFF)
 
     def stop(self):
         self._is_running = False
         self.set_valves(water_on=False, air_on=False)
 
 
+# ==============================================================================
+# HMI MAIN WINDOW
+# ==============================================================================
 class SensorHMIWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HMI Auto Purging - Teledyne LGA 4000Z")
-        self.showFullScreen()  # Tampilan penuh layar HMI
-        self.setStyleSheet("background-color: #111827; color: #ffffff;")
+        self.setWindowTitle("HMI Auto Purging - PT Pupuk Kujang")
+        self.showFullScreen()
+        self.setStyleSheet("background-color: #0f172a; color: #ffffff;")
 
-        self.worker = None
+        self.worker_p = None
+        self.worker_a = None
+        self.last_purge_p = time.time()
+        self.last_purge_a = time.time()
+
         self.init_ui()
+
+        # Timer Pembacaan ADC & Trigger Automatis (Setiap 1 Detik)
+        self.adc_timer = QTimer()
+        self.adc_timer.timeout.connect(self.process_adc_and_triggers)
+        self.adc_timer.start(1000)
 
     def init_ui(self):
         main_layout = QVBoxLayout()
 
-        # Header
-        title = QLabel("SYSTEM HMI AUTOMATIC SENSOR CLEANING")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("color: #38bdf8; padding: 12px; background-color: #1e293b; border-radius: 8px;")
-        main_layout.addWidget(title)
+        # --- 1. HEADER DENGAN LOGO PUPUK KUJANG ---
+        header_frame = QFrame()
+        header_frame.setStyleSheet("background-color: #1e293b; border-radius: 8px; padding: 10px;")
+        header_layout = QHBoxLayout(header_frame)
 
-        sub_title = QLabel("Area: Prilling Tower PT Pupuk Kujang Cikampek | Sensor: Teledyne LGA 4000Z")
-        sub_title.setFont(QFont("Arial", 10))
-        sub_title.setAlignment(Qt.AlignCenter)
-        sub_title.setStyleSheet("color: #94a3b8; margin-bottom: 8px;")
-        main_layout.addWidget(sub_title)
+        # Import Logo Pupuk Kujang
+        lbl_logo = QLabel()
+        logo_path = "logo_mobile (1).png"
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            lbl_logo.setPixmap(pixmap.scaledToHeight(65, Qt.SmoothTransformation))
+        else:
+            lbl_logo.setText("[LOGO]")
+            lbl_logo.setFont(QFont("Arial", 12, QFont.Bold))
+        header_layout.addWidget(lbl_logo)
 
-        # Indicator Frame
-        status_frame = QFrame()
-        status_frame.setStyleSheet("background-color: #1e293b; border-radius: 8px; padding: 10px;")
-        status_layout = QHBoxLayout(status_frame)
+        # Judul Header
+        title_box = QVBoxLayout()
+        title_main = QLabel("SYSTEM HMI AUTOMATIC SENSOR PURGING")
+        title_main.setFont(QFont("Arial", 16, QFont.Bold))
+        title_main.setStyleSheet("color: #38bdf8;")
+        
+        title_sub = QLabel("Prilling Tower PT Pupuk Kujang Cikampek | Sensor Teledyne LGA 4000Z")
+        title_sub.setFont(QFont("Arial", 10))
+        title_sub.setStyleSheet("color: #94a3b8;")
 
-        self.lbl_water = QLabel("SOLENOID WATER\n[ OFF ]")
-        self.lbl_water.setFont(QFont("Arial", 12, QFont.Bold))
-        self.lbl_water.setAlignment(Qt.AlignCenter)
-        self.lbl_water.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 6px; padding: 20px;")
-        status_layout.addWidget(self.lbl_water)
+        title_box.addWidget(title_main)
+        title_box.addWidget(title_sub)
+        header_layout.addLayout(title_box)
+        header_layout.addStretch()
 
-        self.lbl_air = QLabel("SOLENOID AIR\n[ OFF ]")
-        self.lbl_air.setFont(QFont("Arial", 12, QFont.Bold))
-        self.lbl_air.setAlignment(Qt.AlignCenter)
-        self.lbl_air.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 6px; padding: 20px;")
-        status_layout.addWidget(self.lbl_air)
+        main_layout.addWidget(header_frame)
 
-        main_layout.addWidget(status_frame)
+        # --- 2. MONITORING PANEL (PARTIKULER & AMONIA) ---
+        grid_panel = QGridLayout()
 
-        # Status & Progress
-        self.lbl_status = QLabel("STATUS SISTEM: STANDBY")
-        self.lbl_status.setFont(QFont("Arial", 12, QFont.Bold))
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        self.lbl_status.setStyleSheet("color: #4ade80; margin-top: 8px;")
-        main_layout.addWidget(self.lbl_status)
+        # Card Partikuler
+        grid_panel.addWidget(self.create_unit_card("PARTIKULER", "P"), 0, 0)
+        # Card Amonia
+        grid_panel.addWidget(self.create_unit_card("AMONIA", "A"), 0, 1)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(25)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar { border: 1px solid #475569; border-radius: 6px; text-align: center; color: white; background: #1e293b; }
-            QProgressBar::chunk { background-color: #0284c7; }
-        """)
-        main_layout.addWidget(self.progress_bar)
+        main_layout.addLayout(grid_panel)
 
-        # Tombol Kontrol
+        # --- 3. CONTROL BUTTONS ---
         btn_layout = QHBoxLayout()
-        self.btn_start = QPushButton("START PURGING")
-        self.btn_start.setFont(QFont("Arial", 11, QFont.Bold))
-        self.btn_start.setStyleSheet("background-color: #22c55e; color: #000000; padding: 14px; border-radius: 6px;")
-        self.btn_start.clicked.connect(self.start_purging)
-        btn_layout.addWidget(self.btn_start)
 
-        self.btn_stop = QPushButton("EMERGENCY STOP")
-        self.btn_stop.setFont(QFont("Arial", 11, QFont.Bold))
-        self.btn_stop.setStyleSheet("background-color: #ef4444; color: #ffffff; padding: 14px; border-radius: 6px;")
-        self.btn_stop.clicked.connect(self.stop_purging)
-        self.btn_stop.setEnabled(False)
+        self.btn_start_p = QPushButton("START PURGING PARTIKULER")
+        self.btn_start_p.setFont(QFont("Arial", 10, QFont.Bold))
+        self.btn_start_p.setStyleSheet("background-color: #0284c7; color: white; padding: 12px; border-radius: 6px;")
+        self.btn_start_p.clicked.connect(lambda: self.start_purging("P"))
+        btn_layout.addWidget(self.btn_start_p)
+
+        self.btn_start_a = QPushButton("START PURGING AMONIA")
+        self.btn_start_a.setFont(QFont("Arial", 10, QFont.Bold))
+        self.btn_start_a.setStyleSheet("background-color: #0d9488; color: white; padding: 12px; border-radius: 6px;")
+        self.btn_start_a.clicked.connect(lambda: self.start_purging("A"))
+        btn_layout.addWidget(self.btn_start_a)
+
+        self.btn_stop = QPushButton("EMERGENCY STOP ALL")
+        self.btn_stop.setFont(QFont("Arial", 10, QFont.Bold))
+        self.btn_stop.setStyleSheet("background-color: #dc2626; color: white; padding: 12px; border-radius: 6px;")
+        self.btn_stop.clicked.connect(self.stop_all_purging)
         btn_layout.addWidget(self.btn_stop)
 
         self.btn_exit = QPushButton("KELUAR HMI")
-        self.btn_exit.setFont(QFont("Arial", 11, QFont.Bold))
-        self.btn_exit.setStyleSheet("background-color: #64748b; color: #ffffff; padding: 14px; border-radius: 6px;")
+        self.btn_exit.setFont(QFont("Arial", 10, QFont.Bold))
+        self.btn_exit.setStyleSheet("background-color: #475569; color: white; padding: 12px; border-radius: 6px;")
         self.btn_exit.clicked.connect(self.close)
         btn_layout.addWidget(self.btn_exit)
 
         main_layout.addLayout(btn_layout)
 
-        # Log Text Box
+        # --- 4. LOG ACTIVITY BOX ---
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setStyleSheet("background-color: #020617; color: #e2e8f0; font-family: Monospace; font-size: 10pt; border-radius: 6px;")
+        self.txt_log.setStyleSheet("background-color: #020617; color: #38bdf8; font-family: Monospace; font-size: 9pt; border-radius: 6px;")
         main_layout.addWidget(self.txt_log)
 
         container = QWidget()
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        self.append_log("Sistem HMI Berhasil Dijalankan di Raspberry Pi.")
+        self.append_log("Sistem HMI Berhasil Dimuat. Logo Pupuk Kujang Terpasang.")
 
-    def start_purging(self):
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.progress_bar.setValue(0)
+    def create_unit_card(self, title, code):
+        card = QFrame()
+        card.setStyleSheet("background-color: #1e293b; border-radius: 8px; padding: 10px;")
+        layout = QVBoxLayout(card)
 
-        self.worker = PurgingWorker(water_time=5, air_time=10)
-        self.worker.status_signal.connect(lambda txt: self.lbl_status.setText(f"STATUS SISTEM: {txt}"))
-        self.worker.log_signal.connect(self.append_log)
-        self.worker.water_status_signal.connect(self.update_water_indicator)
-        self.worker.air_status_signal.connect(self.update_air_indicator)
-        self.worker.progress_signal.connect(self.progress_bar.setValue)
-        self.worker.finished_signal.connect(self.on_finished)
-        self.worker.start()
+        lbl_title = QLabel(f"UNIT ANALYZER {title}")
+        lbl_title.setFont(QFont("Arial", 12, QFont.Bold))
+        lbl_title.setStyleSheet("color: #f8fafc;")
+        layout.addWidget(lbl_title)
 
-    def stop_purging(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
+        # Current mA Display
+        lbl_ma = QLabel("Sinyal Analog: 12.00 mA")
+        lbl_ma.setFont(QFont("Arial", 11, QFont.Bold))
+        lbl_ma.setStyleSheet("color: #34d399;")
+        setattr(self, f"lbl_ma_{code}", lbl_ma)
+        layout.addWidget(lbl_ma)
 
-    def on_finished(self):
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        # Valve Indicators
+        valves_layout = QHBoxLayout()
+        
+        lbl_w = QLabel("WATER VALVE\n[ OFF ]")
+        lbl_w.setAlignment(Qt.AlignCenter)
+        lbl_w.setFont(QFont("Arial", 9, QFont.Bold))
+        lbl_w.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 4px; padding: 10px;")
+        setattr(self, f"lbl_w_{code}", lbl_w)
+        valves_layout.addWidget(lbl_w)
 
-    def update_water_indicator(self, is_active):
-        if is_active:
-            self.lbl_water.setText("SOLENOID WATER\n[ SPRAYING ON ]")
-            self.lbl_water.setStyleSheet("background-color: #38bdf8; color: #0f172a; border-radius: 6px; padding: 20px; font-weight: bold;")
+        lbl_a = QLabel("AIR VALVE\n[ OFF ]")
+        lbl_a.setAlignment(Qt.AlignCenter)
+        lbl_a.setFont(QFont("Arial", 9, QFont.Bold))
+        lbl_a.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 4px; padding: 10px;")
+        setattr(self, f"lbl_a_{code}", lbl_a)
+        valves_layout.addWidget(lbl_a)
+
+        layout.addLayout(valves_layout)
+
+        # Progress Bar
+        pbar = QProgressBar()
+        pbar.setValue(0)
+        pbar.setFixedHeight(18)
+        pbar.setStyleSheet("""
+            QProgressBar { border: 1px solid #475569; border-radius: 4px; text-align: center; color: white; background: #0f172a; }
+            QProgressBar::chunk { background-color: #38bdf8; }
+        """)
+        setattr(self, f"pbar_{code}", pbar)
+        layout.addWidget(pbar)
+
+        # Status Label
+        lbl_status = QLabel("STATUS: STANDBY")
+        lbl_status.setFont(QFont("Arial", 10, QFont.Bold))
+        lbl_status.setStyleSheet("color: #4ade80;")
+        setattr(self, f"lbl_status_{code}", lbl_status)
+        layout.addWidget(lbl_status)
+
+        return card
+
+    # ==========================================================================
+    # LOGIKA READ ADC & 3 TRIGGER CONDITIONS
+    # ==========================================================================
+    def process_adc_and_triggers(self):
+        # Pembacaan Sinyal mA
+        ma_p = self.read_current_ma("P")
+        ma_a = self.read_current_ma("A")
+
+        getattr(self, "lbl_ma_P").setText(f"Sinyal Analog: {ma_p:.2f} mA")
+        getattr(self, "lbl_ma_A").setText(f"Sinyal Analog: {ma_a:.2f} mA")
+
+        # --- CHECK TRIGGER 2: SENSOR FAULT (<4mA ATAU >20mA) ---
+        if (ma_p < 4.0 or ma_p > 20.0) and (not self.worker_p or not self.worker_p.isRunning()):
+            self.append_log(f"[TRIGGER SENSOR FAULT] Unit Partikuler terdeteksi fault ({ma_p:.2f} mA). Memulai Purging...")
+            self.start_purging("P")
+
+        if (ma_a < 4.0 or ma_a > 20.0) and (not self.worker_a or not self.worker_a.isRunning()):
+            self.append_log(f"[TRIGGER SENSOR FAULT] Unit Amonia terdeteksi fault ({ma_a:.2f} mA). Memulai Purging...")
+            self.start_purging("A")
+
+        # --- CHECK TRIGGER 3: TIMER MINGGUAN (168 JAM) ---
+        weekly_sec = 7 * 24 * 3600
+        now = time.time()
+        if (now - self.last_purge_p >= weekly_sec) and (not self.worker_p or not self.worker_p.isRunning()):
+            self.append_log("[TRIGGER TIMER MINGGUAN] Rutin 1 Minggu Partikuler. Memulai Purging...")
+            self.start_purging("P")
+
+        if (now - self.last_purge_a >= weekly_sec) and (not self.worker_a or not self.worker_a.isRunning()):
+            self.append_log("[TRIGGER TIMER MINGGUAN] Rutin 1 Minggu Amonia. Memulai Purging...")
+            self.start_purging("A")
+
+    def read_current_ma(self, code):
+        if HAS_ADC:
+            try:
+                chan = chan_p if code == "P" else chan_a
+                voltage = chan.voltage
+                ma = (voltage / 3.3) * 20.0
+                return max(0.0, min(ma, 25.0))
+            except Exception:
+                return 12.0
+        return 12.00  # Default simulasi normal
+
+    # ==========================================================================
+    # PURGING CONTROL HANDLERS
+    # ==========================================================================
+    def start_purging(self, code):
+        if code == "P":
+            if self.worker_p and self.worker_p.isRunning(): return
+            self.last_purge_p = time.time()
+            self.worker_p = PurgingWorker("PARTIKULER", RELAY_P_WATER, RELAY_P_AIR)
+            self.connect_worker_signals(self.worker_p, "P")
+            self.worker_p.start()
         else:
-            self.lbl_water.setText("SOLENOID WATER\n[ OFF ]")
-            self.lbl_water.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 6px; padding: 20px;")
+            if self.worker_a and self.worker_a.isRunning(): return
+            self.last_purge_a = time.time()
+            self.worker_a = PurgingWorker("AMONIA", RELAY_A_WATER, RELAY_A_AIR)
+            self.connect_worker_signals(self.worker_a, "A")
+            self.worker_a.start()
 
-    def update_air_indicator(self, is_active):
-        if is_active:
-            self.lbl_air.setText("SOLENOID AIR\n[ PURGING ON ]")
-            self.lbl_air.setStyleSheet("background-color: #f97316; color: #0f172a; border-radius: 6px; padding: 20px; font-weight: bold;")
+    def connect_worker_signals(self, worker, code):
+        worker.status_signal.connect(lambda unit, txt: getattr(self, f"lbl_status_{code}").setText(f"STATUS: {txt}"))
+        worker.log_signal.connect(self.append_log)
+        worker.valve_signal.connect(self.update_valve_indicators)
+        worker.progress_signal.connect(lambda unit, val: getattr(self, f"pbar_{code}").setValue(val))
+
+    def update_valve_indicators(self, unit_name, water_on, air_on):
+        code = "P" if unit_name == "PARTIKULER" else "A"
+        lbl_w = getattr(self, f"lbl_w_{code}")
+        lbl_a = getattr(self, f"lbl_a_{code}")
+
+        if water_on:
+            lbl_w.setText("WATER VALVE\n[ SPRAYING ]")
+            lbl_w.setStyleSheet("background-color: #38bdf8; color: #020617; border-radius: 4px; padding: 10px; font-weight: bold;")
         else:
-            self.lbl_air.setText("SOLENOID AIR\n[ OFF ]")
-            self.lbl_air.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 6px; padding: 20px;")
+            lbl_w.setText("WATER VALVE\n[ OFF ]")
+            lbl_w.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 4px; padding: 10px;")
+
+        if air_on:
+            lbl_a.setText("AIR VALVE\n[ PURGING ]")
+            lbl_a.setStyleSheet("background-color: #f97316; color: #020617; border-radius: 4px; padding: 10px; font-weight: bold;")
+        else:
+            lbl_a.setText("AIR VALVE\n[ OFF ]")
+            lbl_a.setStyleSheet("background-color: #334155; color: #94a3b8; border-radius: 4px; padding: 10px;")
+
+    def stop_all_purging(self):
+        if self.worker_p and self.worker_p.isRunning(): self.worker_p.stop()
+        if self.worker_a and self.worker_a.isRunning(): self.worker_a.stop()
 
     def append_log(self, msg):
         now = datetime.now().strftime("%H:%M:%S")
         self.txt_log.append(f"[{now}] {msg}")
 
     def closeEvent(self, event):
-        GPIO.cleanup()
+        if IS_PI:
+            GPIO.cleanup()
         event.accept()
 
 
